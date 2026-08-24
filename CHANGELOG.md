@@ -5,6 +5,36 @@ All notable changes to acplint are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Findings no longer describe acplint's own category selection as an agent
+  defect.** Running a subset such as `--categories initialization
+  session_lifecycle` always emitted findings claiming the agent sent no
+  `agent_thought_chunk`, `available_commands_update`, or `usage_update`. Two
+  causes: coverage was recorded only inside `_test_streaming` and `_test_plans`,
+  so notifications delivered during `session/new` were invisible even though the
+  transport had queued them; and `_assemble_findings` never consulted the
+  selected categories, so it reported prompt-only update types as missing when
+  nothing had prompted the agent. The transport now records `sessionUpdate`
+  types as notifications arrive, and findings for optional update types are
+  raised only when a selected category could have elicited them. Fixes #3.
+- **No more `RuntimeError: Event loop is closed` traceback at interpreter
+  shutdown.** `AcpTransport.__aexit__` cancelled the reader tasks without
+  awaiting them, did not await the process after `kill()`, and never closed the
+  asyncio subprocess transport. The unclosed transport outlived the loop that
+  `asyncio.run()` closed, and its `__del__` scheduled a callback on the dead
+  loop. Teardown now awaits the cancelled tasks, reaps a killed process, and
+  closes the subprocess transport while the loop is still open. Fixes #4.
+
+### Added
+
+- Test suite under `tests/`, using the `pytest` and `pytest-asyncio` dev
+  dependencies and the `asyncio_mode = "auto"` setting already declared in
+  `pyproject.toml`. Covers both fixes above by linting throwaway ACP agents
+  built for each case.
+
 ## [0.2.0] - 2026-07-10
 
 ACP v1 spec-conformance alignment for the runner and schema. These are general

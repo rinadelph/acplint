@@ -81,6 +81,16 @@ ALL_SESSION_UPDATE_TYPES = [
 # Updates that are REQUIRED for conformance — missing these is a FAIL
 REQUIRED_UPDATE_TYPES = {"agent_message_chunk"}
 
+# Categories whose tests can actually elicit each optional update type. When none
+# of the listed categories were selected, the agent was never given a chance to
+# send the update, so "never received" describes acplint's own configuration
+# rather than the agent, and no finding is raised.
+UPDATE_TYPE_SOURCE_CATEGORIES = {
+    "agent_thought_chunk": {"streaming"},
+    "available_commands_update": {"session_lifecycle", "streaming"},
+    "usage_update": {"streaming"},
+}
+
 # Updates that are recommended — missing these generates a finding but not a FAIL
 RECOMMENDED_UPDATE_TYPES = {
     "agent_thought_chunk",
@@ -1718,7 +1728,7 @@ class ConformanceRunner:
             "coverage_methods_exercised", "schema_validation", TestStatus.PASS,
             details={
                 "methods_called": sorted(self._coverage["methods_called"]),
-                "update_types_seen": sorted(self._coverage["update_types_seen"]),
+                "update_types_seen": sorted(self._observed_update_types()),
                 "agent_request_methods_seen": sorted(self._coverage["agent_request_methods_seen"]),
             },
         )
@@ -1727,13 +1737,33 @@ class ConformanceRunner:
     # Findings assembly
     # -----------------------------------------------------------------------
 
+    def _observed_update_types(self) -> set[str]:
+        """Every session update type seen, from any test or none.
+
+        The transport records update types as notifications arrive, which catches
+        the ones an agent sends outside a prompt turn (available_commands_update
+        on session/new, for example). Individual tests also record what they saw,
+        so the two are unioned.
+        """
+        observed = set(self._coverage["update_types_seen"])
+        if self._transport is not None:
+            observed |= self._transport.seen_update_types
+        return observed
+
+    def _update_type_was_exercised(self, update_type: str) -> bool:
+        """Whether any selected category could have elicited this update type."""
+        sources = UPDATE_TYPE_SOURCE_CATEGORIES.get(update_type)
+        if sources is None:
+            return True
+        return bool(sources & set(self._categories))
+
     def _assemble_findings(self) -> None:
         """Collect findings from coverage gaps that weren't caught by individual tests."""
-        seen_update_types = self._coverage["update_types_seen"]
+        seen_update_types = self._observed_update_types()
 
         # Check for update types we never saw at all
         for update_type in ALL_SESSION_UPDATE_TYPES:
-            if update_type not in seen_update_types:
+            if update_type not in seen_update_types and self._update_type_was_exercised(update_type):
                 if update_type in REQUIRED_UPDATE_TYPES:
                     # Already handled as FAIL in streaming tests
                     pass

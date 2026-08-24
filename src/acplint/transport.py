@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from typing import Any, Callable
@@ -13,6 +14,7 @@ from acplint.schema import (
     METHOD_READ_TEXT_FILE,
     METHOD_RELEASE_TERMINAL,
     METHOD_REQUEST_PERMISSION,
+    METHOD_SESSION_UPDATE,
     METHOD_TERMINAL_OUTPUT,
     METHOD_WAIT_FOR_TERMINAL_EXIT,
     METHOD_WRITE_TEXT_FILE,
@@ -50,6 +52,9 @@ class AcpTransport:
         self._terminal_handler = terminal_handler
         self._stderr_lines: list[str] = []
         self._stderr_task: asyncio.Task | None = None
+        # Session update types observed on the wire, regardless of which test
+        # was running when they arrived.
+        self.seen_update_types: set[str] = set()
 
     async def __aenter__(self) -> AcpTransport:
         self._process = await asyncio.create_subprocess_exec(
@@ -65,21 +70,43 @@ class AcpTransport:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        if self._reader_task:
-            self._reader_task.cancel()
-        if self._stderr_task:
-            self._stderr_task.cancel()
-        if self._process and self._process.returncode is None:
-            self._process.terminate()
-            try:
-                await asyncio.wait_for(self._process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                self._process.kill()
+        # Await the cancelled tasks so their cancellation is observed while the
+        # loop is still running.
+        for task in (self._reader_task, self._stderr_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        if self._process is not None:
+            if self._process.returncode is None:
+                self._process.terminate()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    self._process.kill()
+                    # Reap the killed process too. Without this the pipe teardown
+                    # callbacks never run before the loop closes.
+                    await self._process.wait()
+            self._close_process_transport()
         # Cancel any pending request futures
         for future in self._pending_requests.values():
             if not future.done():
                 future.cancel()
         self._pending_requests.clear()
+
+    def _close_process_transport(self) -> None:
+        """Close the subprocess transport while the loop is still open.
+
+        asyncio.subprocess.Process exposes no public close(), so an unclosed
+        transport is left to the garbage collector. By then asyncio.run() has
+        closed the loop, and BaseSubprocessTransport.__del__ calls close(),
+        which reaches write_eof() on a still-open stdin pipe and schedules a
+        callback on a closed loop. CPython prints that as "Exception ignored in"
+        with a RuntimeError traceback, after a run that otherwise succeeded.
+        """
+        transport = getattr(self._process, "_transport", None)
+        if transport is not None:
+            transport.close()
 
     def _allocate_id(self) -> int:
         request_id = self._next_id
@@ -334,7 +361,29 @@ class AcpTransport:
             # This is a notification
             method = message.get("method", "")
             logger.debug("← notif method=%s", method)
+            self._record_update_type(message)
             await self._notifications.put(message)
+
+    def _record_update_type(self, message: dict[str, Any]) -> None:
+        """Track session/update types as they arrive.
+
+        Coverage is recorded here rather than inside an individual test because
+        agents legitimately send notifications outside a prompt turn, for
+        example available_commands_update in response to session/new. Recording
+        only where a particular test happens to look makes an agent appear not
+        to support something it demonstrably sent.
+        """
+        if message.get("method") != METHOD_SESSION_UPDATE:
+            return
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return
+        update = params.get("update")
+        if not isinstance(update, dict):
+            return
+        update_type = update.get("sessionUpdate")
+        if isinstance(update_type, str) and update_type:
+            self.seen_update_types.add(update_type)
 
     async def _handle_agent_request(self, message: dict[str, Any]) -> None:
         """Handle an incoming request from the agent by auto-responding or queuing it."""
